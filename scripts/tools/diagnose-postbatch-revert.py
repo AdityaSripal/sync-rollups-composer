@@ -40,8 +40,8 @@ input_data = tx.input[4:]
 entry_tuple = "(uint256,bytes32,bytes32,int256)[]"
 action_tuple = "(uint8,uint256,address,uint256,bytes,bool,address,uint256,uint256[])"
 exec_entry_tuple = f"({entry_tuple},bytes32,{action_tuple})"
-sig = f"({exec_entry_tuple}[],uint256,bytes,bytes)"
-entries, blob_count, call_data, proof = abi_decode([sig], input_data)[0]
+types = [f"{exec_entry_tuple}[]", "uint256", "bytes", "bytes"]
+entries, blob_count, call_data, proof = abi_decode(types, input_data)
 
 print(f"\n=== postBatch inputs ===")
 print(f"  entries:    {len(entries)}")
