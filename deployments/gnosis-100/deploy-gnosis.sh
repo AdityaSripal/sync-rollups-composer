@@ -28,6 +28,35 @@
 #   BOOTSTRAP_ACCOUNTS — comma-separated addr:eth pairs for block 1 funding (default: empty)
 set -euo pipefail
 
+# Print the failing line on any error, so we never have a silent exit.
+# $LINENO is the line where the trap fires; BASH_COMMAND is the command that failed.
+trap 'rc=$?; echo ""; echo "===================================================================="; echo "FAILED at ${BASH_SOURCE[0]}:${LINENO}  (exit=${rc})"; echo "command: ${BASH_COMMAND}"; echo "===================================================================="; exit $rc' ERR
+
+# Wrappers around forge create / cast send that always echo their output.
+# These replace the bare `$(... 2>&1)` capture pattern that was hiding failures.
+#
+# Usage: run_capture VAR_NAME LABEL -- <command...>
+#   Runs the command, prints its full output, AND assigns it to VAR_NAME
+#   so caller can grep for "Deployed to:" / "contractAddress" etc.
+run_capture() {
+    local __var_name="$1"; shift
+    local __label="$1"; shift
+    [ "$1" = "--" ] && shift
+    echo ""
+    echo "  --> ${__label}"
+    echo "      \$ $*"
+    local __tmp; __tmp=$(mktemp)
+    local __rc=0
+    "$@" 2>&1 | tee "$__tmp" || __rc=${PIPESTATUS[0]}
+    local __out; __out=$(cat "$__tmp")
+    rm -f "$__tmp"
+    if [ "$__rc" -ne 0 ]; then
+        echo "  !!! ${__label} exited with code ${__rc}"
+        return $__rc
+    fi
+    printf -v "$__var_name" '%s' "$__out"
+}
+
 GNOSIS_RPC="${1:?Usage: deploy-gnosis.sh <GNOSIS_RPC_URL> <DEPLOYER_PRIVATE_KEY> [BUILDER_PRIVATE_KEY]}"
 DEPLOYER_KEY="${2:?Usage: deploy-gnosis.sh <GNOSIS_RPC_URL> <DEPLOYER_PRIVATE_KEY> [BUILDER_PRIVATE_KEY]}"
 BUILDER_KEY="${3:-$DEPLOYER_KEY}"
@@ -108,14 +137,14 @@ _bc() { (grep -o '"object":"0x[0-9a-fA-F]*"' "$1" || true) | head -1 | sed 's/"o
 
 echo ""
 echo "Deploying tmpECDSAVerifier (owner=${DEPLOYER_ADDR}, signer=${BUILDER_ADDRESS})..."
-VERIFIER_OUTPUT=$(forge create \
+run_capture VERIFIER_OUTPUT "forge create tmpECDSAVerifier" -- \
+    forge create \
     --rpc-url "$GNOSIS_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
     --gas-limit 3000000 \
     src/verifier/tmpECDSAVerifier.sol:tmpECDSAVerifier \
-    --constructor-args "$DEPLOYER_ADDR" "$BUILDER_ADDRESS" 2>&1)
-echo "$VERIFIER_OUTPUT"
+    --constructor-args "$DEPLOYER_ADDR" "$BUILDER_ADDRESS"
 
 VERIFIER_ADDRESS=$(echo "$VERIFIER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 if [ -z "$VERIFIER_ADDRESS" ]; then
@@ -128,14 +157,14 @@ echo "tmpECDSAVerifier deployed at: ${VERIFIER_ADDRESS}"
 
 echo ""
 echo "Deploying Rollups contract..."
-ROLLUPS_OUTPUT=$(forge create \
+run_capture ROLLUPS_OUTPUT "forge create Rollups" -- \
+    forge create \
     --rpc-url "$GNOSIS_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
     --gas-limit 8000000 \
     src/Rollups.sol:Rollups \
-    --constructor-args "$VERIFIER_ADDRESS" 1 2>&1)
-echo "$ROLLUPS_OUTPUT"
+    --constructor-args "$VERIFIER_ADDRESS" 1
 
 ROLLUPS_ADDRESS=$(echo "$ROLLUPS_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 DEPLOY_TX=$(echo "$ROLLUPS_OUTPUT" | grep "Transaction hash:" | awk '{print $3}')
@@ -196,16 +225,28 @@ echo "Genesis state root: ${GENESIS_STATE_ROOT}"
 # ── Register rollup (rollup_id = 1) ──────────────────────────────────
 
 echo "Registering rollup (createRollup)..."
-REGISTER_OUTPUT=$(cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+run_capture REGISTER_OUTPUT "cast send createRollup" -- \
+    cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
     --gas-limit 1500000 \
     "$ROLLUPS_ADDRESS" \
     "createRollup(bytes32,bytes32,address)(uint256)" \
     "$GENESIS_STATE_ROOT" \
     "0x0000000000000000000000000000000000000000000000000000000000000001" \
-    "$DEPLOYER_ADDR" 2>&1)
-echo "createRollup result: ${REGISTER_OUTPUT}"
+    "$DEPLOYER_ADDR"
 
-ROLLUP_ID=$(cast call --rpc-url "$GNOSIS_RPC" "$ROLLUPS_ADDRESS" "rollupCounter()(uint256)" 2>&1)
+# Verify the createRollup tx actually succeeded (status 1) — cast send will return 0
+# even on a successful submission whose tx then reverts on-chain.
+CREATE_TX=$(echo "$REGISTER_OUTPUT" | awk '/^transactionHash/{print $2}')
+CREATE_STATUS=$(echo "$REGISTER_OUTPUT" | awk '/^status/{print $2}')
+echo "createRollup tx: ${CREATE_TX}  status: ${CREATE_STATUS}"
+if [ "$CREATE_STATUS" != "1" ]; then
+    echo "ERROR: createRollup tx did not succeed (status=${CREATE_STATUS})"
+    echo "Replay it with: cast run ${CREATE_TX} --rpc-url ${GNOSIS_RPC}"
+    exit 1
+fi
+
+run_capture ROLLUP_ID "cast call rollupCounter()" -- \
+    cast call --rpc-url "$GNOSIS_RPC" "$ROLLUPS_ADDRESS" "rollupCounter()(uint256)"
 echo "Rollup counter: ${ROLLUP_ID}"
 
 # ── Get deployment metadata ───────────────────────────────────────────
@@ -269,34 +310,53 @@ echo "Deploying Bridge contract on L1..."
 BRIDGE_BYTECODE_FILE="${SHARED_DIR}/bridge_bytecode.txt"
 echo "$BRIDGE_BYTECODE" > "$BRIDGE_BYTECODE_FILE"
 
-BRIDGE_DEPLOY_OUTPUT=$(cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+run_capture BRIDGE_DEPLOY_OUTPUT "cast send --create Bridge L1" -- \
+    cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
     --gas-limit 8000000 \
-    --create "$BRIDGE_BYTECODE" 2>&1)
-BRIDGE_L1_ADDRESS=$(echo "$BRIDGE_DEPLOY_OUTPUT" | grep "contractAddress" | awk '{print $NF}')
+    --create "$BRIDGE_BYTECODE"
+BRIDGE_L1_ADDRESS=$(echo "$BRIDGE_DEPLOY_OUTPUT" | awk '/^contractAddress/{print $2}')
+BRIDGE_DEPLOY_STATUS=$(echo "$BRIDGE_DEPLOY_OUTPUT" | awk '/^status/{print $2}')
+echo "Bridge L1 deploy status: ${BRIDGE_DEPLOY_STATUS}  address: ${BRIDGE_L1_ADDRESS}"
 
-if [ -n "$BRIDGE_L1_ADDRESS" ] && [ "$BRIDGE_L1_ADDRESS" != "null" ]; then
+if [ -n "$BRIDGE_L1_ADDRESS" ] && [ "$BRIDGE_L1_ADDRESS" != "null" ] && [ "$BRIDGE_DEPLOY_STATUS" = "1" ]; then
     echo "Bridge L1 deployed at: ${BRIDGE_L1_ADDRESS}"
 
     # Initialize: manager=Rollups, rollupId=0 (L1), admin=deployer
-    cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+    run_capture BRIDGE_INIT_OUTPUT "cast send Bridge.initialize" -- \
+        cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
         --gas-limit 1500000 \
         "$BRIDGE_L1_ADDRESS" \
         "initialize(address,uint256,address)" \
-        "$ROLLUPS_ADDRESS" 0 "$DEPLOYER_ADDR" > /dev/null 2>&1
+        "$ROLLUPS_ADDRESS" 0 "$DEPLOYER_ADDR"
+    BRIDGE_INIT_STATUS=$(echo "$BRIDGE_INIT_OUTPUT" | awk '/^status/{print $2}')
+    BRIDGE_INIT_TX=$(echo "$BRIDGE_INIT_OUTPUT" | awk '/^transactionHash/{print $2}')
+    echo "Bridge.initialize tx: ${BRIDGE_INIT_TX}  status: ${BRIDGE_INIT_STATUS}"
+    if [ "$BRIDGE_INIT_STATUS" != "1" ]; then
+        echo "ERROR: Bridge.initialize tx did not succeed (status=${BRIDGE_INIT_STATUS})"
+        echo "Replay it with: cast run ${BRIDGE_INIT_TX} --rpc-url ${GNOSIS_RPC}"
+        exit 1
+    fi
     echo "Bridge L1 initialized (manager=${ROLLUPS_ADDRESS}, rollupId=0, admin=${DEPLOYER_ADDR})"
 
     # Set canonical bridge address: L1 Bridge -> L2 Bridge address
     echo "Setting canonicalBridgeAddress on L1 Bridge -> ${BRIDGE_L2_ADDRESS}..."
-    cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+    run_capture BRIDGE_SETCANON_OUTPUT "cast send setCanonicalBridgeAddress" -- \
+        cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
         --gas-limit 200000 \
         "$BRIDGE_L1_ADDRESS" \
         "setCanonicalBridgeAddress(address)" \
-        "$BRIDGE_L2_ADDRESS" > /dev/null 2>&1
+        "$BRIDGE_L2_ADDRESS"
+    BRIDGE_SETCANON_STATUS=$(echo "$BRIDGE_SETCANON_OUTPUT" | awk '/^status/{print $2}')
+    BRIDGE_SETCANON_TX=$(echo "$BRIDGE_SETCANON_OUTPUT" | awk '/^transactionHash/{print $2}')
+    echo "setCanonicalBridgeAddress tx: ${BRIDGE_SETCANON_TX}  status: ${BRIDGE_SETCANON_STATUS}"
+    if [ "$BRIDGE_SETCANON_STATUS" != "1" ]; then
+        echo "ERROR: setCanonicalBridgeAddress tx did not succeed (status=${BRIDGE_SETCANON_STATUS})"
+        echo "Replay it with: cast run ${BRIDGE_SETCANON_TX} --rpc-url ${GNOSIS_RPC}"
+        exit 1
+    fi
     echo "L1 Bridge canonicalBridgeAddress set to ${BRIDGE_L2_ADDRESS}"
 else
-    echo "ERROR: Bridge L1 deployment failed"
-    echo "Deploy output:"
-    echo "$BRIDGE_DEPLOY_OUTPUT"
+    echo "ERROR: Bridge L1 deployment failed (address='${BRIDGE_L1_ADDRESS}' status='${BRIDGE_DEPLOY_STATUS}')"
     rm -f "$BRIDGE_BYTECODE_FILE"
     exit 1
 fi
