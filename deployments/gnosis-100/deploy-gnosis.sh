@@ -191,7 +191,8 @@ echo "Bridge L2 address (CREATE nonce=2):  ${BRIDGE_L2_ADDRESS}"
 # must match the genesis block state root which includes this allocation.
 # See CLAUDE.md: "CCM gets 1M ETH in genesis.json alloc. No runtime minting needed."
 
-SHARED_DIR="${SHARED_DIR:-/tmp/deploy-gnosis-$$}"
+SHARED_DIR_DEFAULT="/tmp/deploy-gnosis-$$"
+SHARED_DIR="${SHARED_DIR:-$SHARED_DIR_DEFAULT}"
 mkdir -p "$SHARED_DIR"
 CCM_ADDR_LOWER=$(echo "${CROSS_CHAIN_MANAGER_ADDRESS#0x}" | tr '[:upper:]' '[:lower:]')
 echo ""
@@ -424,5 +425,14 @@ else
 fi
 echo "  - Monitor builder balance — each postBatch costs ~0.001-0.01 xDAI"
 
-# Clean up temp dir (keep output file which is at OUTPUT_FILE path, not in SHARED_DIR)
-rm -rf "${SHARED_DIR}"
+# Clean up temp dir — but ONLY if SHARED_DIR is the default /tmp dir we created.
+# When the caller passes SHARED_DIR (e.g. SHARED_DIR=deployments/chiado-10200 to
+# persist the modified genesis.json next to the compose file), we MUST NOT delete
+# their directory.
+if [ "$SHARED_DIR" = "$SHARED_DIR_DEFAULT" ]; then
+    rm -rf "${SHARED_DIR}"
+else
+    echo ""
+    echo "Note: SHARED_DIR=${SHARED_DIR} (caller-provided) preserved"
+    echo "  Modified genesis.json (with CCM pre-mint) is at ${SHARED_DIR}/genesis.json"
+fi
