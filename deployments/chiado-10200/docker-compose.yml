@@ -71,6 +71,7 @@ services:
       BRIDGE_L1_ADDRESS: "${BRIDGE_L1_ADDRESS:-}"
       BRIDGE_L2_ADDRESS: "${BRIDGE_L2_ADDRESS:-}"
       HEALTH_PORT: "${HEALTH_PORT:-9100}"
+      POSTBATCH_TIMESTAMP_LOOKAHEAD: "${POSTBATCH_TIMESTAMP_LOOKAHEAD:-2}"
     healthcheck:
       interval: 10s
       timeout: 5s

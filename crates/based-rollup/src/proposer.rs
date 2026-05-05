@@ -263,18 +263,27 @@ impl Proposer {
     ) -> Result<ProofContext> {
         let vk = self.verification_key().await?;
         let (latest_number, latest_hash, latest_timestamp) = self.latest_l1_block().await?;
-        // Predict the next block's timestamp.
-        // On L1 with fixed block time (e.g., reth --dev.block-time=12s):
-        //   next_ts = latest_ts + block_time
-        // On L1 without fixed block time:
-        //   next_ts = max(latest_ts + 1, now)
-        // Use the L1 slot time from config (defaults to 12s).
+        // Predict the L1 block.timestamp at which postBatch will execute.
         //
-        // **Invariant #22** — the public inputs hash uses
-        // `block.timestamp`, NOT `block.number`. This struct's
-        // `block_timestamp` field is named to make that explicit at
-        // every construction site.
-        let block_timestamp = latest_timestamp + self.config.block_time;
+        // On a controlled L1 (reth --dev): the proposer also drives block
+        // production, so it lands in the very next block at exactly
+        // `latest_ts + block_time`.
+        //
+        // On a real L1 (Chiado/Gnosis): there is unavoidable latency between
+        // reading `latest`, signing, broadcasting, and being included by a
+        // validator. The tx typically lands one slot LATER than "the next
+        // slot" — at `latest + 2 * block_time` or even later if a slot is
+        // missed.
+        //
+        // POSTBATCH_TIMESTAMP_LOOKAHEAD env var controls the multiplier of
+        // block_time we add. Default 1 keeps the legacy reth --dev behaviour;
+        // set to 2 (or higher) on real L1s.
+        let lookahead_slots: u64 = std::env::var("POSTBATCH_TIMESTAMP_LOOKAHEAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let block_timestamp =
+            latest_timestamp + self.config.block_time * lookahead_slots.max(1);
         let entry_hashes = crate::cross_chain::compute_entry_hashes(entries, vk);
         Ok(ProofContext {
             target_block_number: latest_number + 1,
