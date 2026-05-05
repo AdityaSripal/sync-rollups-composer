@@ -107,6 +107,15 @@ if [ "$(echo "$DEPLOYER_BALANCE < 0.1" | bc -l 2>/dev/null || echo "0")" = "1" ]
     echo "WARNING: Deployer balance (${DEPLOYER_BALANCE} xDAI) may be too low for deployment"
 fi
 
+# ── Manual nonce tracking ─────────────────────────────────────────────
+# Public Chiado RPC is load-balanced and eth_getTransactionCount can return
+# stale values across nodes. Fetch the deployer's nonce ONCE here, then pass
+# --nonce explicitly to every forge create / cast send. After each tx
+# advance DEPLOYER_NONCE locally with `next_nonce`.
+DEPLOYER_NONCE=$(cast nonce --rpc-url "$GNOSIS_RPC" "$DEPLOYER_ADDR")
+echo "Starting deployer nonce: ${DEPLOYER_NONCE}"
+next_nonce() { DEPLOYER_NONCE=$((DEPLOYER_NONCE + 1)); }
+
 # ── Idempotency check ─────────────────────────────────────────────────
 
 if [ -f "$OUTPUT_FILE" ]; then
@@ -137,14 +146,16 @@ _bc() { (grep -o '"object":"0x[0-9a-fA-F]*"' "$1" || true) | head -1 | sed 's/"o
 
 echo ""
 echo "Deploying tmpECDSAVerifier (owner=${DEPLOYER_ADDR}, signer=${BUILDER_ADDRESS})..."
-run_capture VERIFIER_OUTPUT "forge create tmpECDSAVerifier" -- \
+run_capture VERIFIER_OUTPUT "forge create tmpECDSAVerifier (nonce=${DEPLOYER_NONCE})" -- \
     forge create \
     --rpc-url "$GNOSIS_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
     --gas-limit 3000000 \
+    --nonce "$DEPLOYER_NONCE" \
     src/verifier/tmpECDSAVerifier.sol:tmpECDSAVerifier \
     --constructor-args "$DEPLOYER_ADDR" "$BUILDER_ADDRESS"
+next_nonce
 
 VERIFIER_ADDRESS=$(echo "$VERIFIER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 if [ -z "$VERIFIER_ADDRESS" ]; then
@@ -157,14 +168,16 @@ echo "tmpECDSAVerifier deployed at: ${VERIFIER_ADDRESS}"
 
 echo ""
 echo "Deploying Rollups contract..."
-run_capture ROLLUPS_OUTPUT "forge create Rollups" -- \
+run_capture ROLLUPS_OUTPUT "forge create Rollups (nonce=${DEPLOYER_NONCE})" -- \
     forge create \
     --rpc-url "$GNOSIS_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
     --gas-limit 8000000 \
+    --nonce "$DEPLOYER_NONCE" \
     src/Rollups.sol:Rollups \
     --constructor-args "$VERIFIER_ADDRESS" 1
+next_nonce
 
 ROLLUPS_ADDRESS=$(echo "$ROLLUPS_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 DEPLOY_TX=$(echo "$ROLLUPS_OUTPUT" | grep "Transaction hash:" | awk '{print $3}')
@@ -225,14 +238,16 @@ echo "Genesis state root: ${GENESIS_STATE_ROOT}"
 # ── Register rollup (rollup_id = 1) ──────────────────────────────────
 
 echo "Registering rollup (createRollup)..."
-run_capture REGISTER_OUTPUT "cast send createRollup" -- \
+run_capture REGISTER_OUTPUT "cast send createRollup (nonce=${DEPLOYER_NONCE})" -- \
     cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
     --gas-limit 1500000 \
+    --nonce "$DEPLOYER_NONCE" \
     "$ROLLUPS_ADDRESS" \
     "createRollup(bytes32,bytes32,address)(uint256)" \
     "$GENESIS_STATE_ROOT" \
     "0x0000000000000000000000000000000000000000000000000000000000000001" \
     "$DEPLOYER_ADDR"
+next_nonce
 
 # Verify the createRollup tx actually succeeded (status 1) — cast send will return 0
 # even on a successful submission whose tx then reverts on-chain.
@@ -310,10 +325,12 @@ echo "Deploying Bridge contract on L1..."
 BRIDGE_BYTECODE_FILE="${SHARED_DIR}/bridge_bytecode.txt"
 echo "$BRIDGE_BYTECODE" > "$BRIDGE_BYTECODE_FILE"
 
-run_capture BRIDGE_DEPLOY_OUTPUT "cast send --create Bridge L1" -- \
+run_capture BRIDGE_DEPLOY_OUTPUT "cast send --create Bridge L1 (nonce=${DEPLOYER_NONCE})" -- \
     cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
     --gas-limit 8000000 \
+    --nonce "$DEPLOYER_NONCE" \
     --create "$BRIDGE_BYTECODE"
+next_nonce
 BRIDGE_L1_ADDRESS=$(echo "$BRIDGE_DEPLOY_OUTPUT" | awk '/^contractAddress/{print $2}')
 BRIDGE_DEPLOY_STATUS=$(echo "$BRIDGE_DEPLOY_OUTPUT" | awk '/^status/{print $2}')
 echo "Bridge L1 deploy status: ${BRIDGE_DEPLOY_STATUS}  address: ${BRIDGE_L1_ADDRESS}"
@@ -322,12 +339,14 @@ if [ -n "$BRIDGE_L1_ADDRESS" ] && [ "$BRIDGE_L1_ADDRESS" != "null" ] && [ "$BRID
     echo "Bridge L1 deployed at: ${BRIDGE_L1_ADDRESS}"
 
     # Initialize: manager=Rollups, rollupId=0 (L1), admin=deployer
-    run_capture BRIDGE_INIT_OUTPUT "cast send Bridge.initialize" -- \
+    run_capture BRIDGE_INIT_OUTPUT "cast send Bridge.initialize (nonce=${DEPLOYER_NONCE})" -- \
         cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
         --gas-limit 1500000 \
+        --nonce "$DEPLOYER_NONCE" \
         "$BRIDGE_L1_ADDRESS" \
         "initialize(address,uint256,address)" \
         "$ROLLUPS_ADDRESS" 0 "$DEPLOYER_ADDR"
+    next_nonce
     BRIDGE_INIT_STATUS=$(echo "$BRIDGE_INIT_OUTPUT" | awk '/^status/{print $2}')
     BRIDGE_INIT_TX=$(echo "$BRIDGE_INIT_OUTPUT" | awk '/^transactionHash/{print $2}')
     echo "Bridge.initialize tx: ${BRIDGE_INIT_TX}  status: ${BRIDGE_INIT_STATUS}"
@@ -340,12 +359,14 @@ if [ -n "$BRIDGE_L1_ADDRESS" ] && [ "$BRIDGE_L1_ADDRESS" != "null" ] && [ "$BRID
 
     # Set canonical bridge address: L1 Bridge -> L2 Bridge address
     echo "Setting canonicalBridgeAddress on L1 Bridge -> ${BRIDGE_L2_ADDRESS}..."
-    run_capture BRIDGE_SETCANON_OUTPUT "cast send setCanonicalBridgeAddress" -- \
+    run_capture BRIDGE_SETCANON_OUTPUT "cast send setCanonicalBridgeAddress (nonce=${DEPLOYER_NONCE})" -- \
         cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
         --gas-limit 200000 \
+        --nonce "$DEPLOYER_NONCE" \
         "$BRIDGE_L1_ADDRESS" \
         "setCanonicalBridgeAddress(address)" \
         "$BRIDGE_L2_ADDRESS"
+    next_nonce
     BRIDGE_SETCANON_STATUS=$(echo "$BRIDGE_SETCANON_OUTPUT" | awk '/^status/{print $2}')
     BRIDGE_SETCANON_TX=$(echo "$BRIDGE_SETCANON_OUTPUT" | awk '/^transactionHash/{print $2}')
     echo "setCanonicalBridgeAddress tx: ${BRIDGE_SETCANON_TX}  status: ${BRIDGE_SETCANON_STATUS}"
