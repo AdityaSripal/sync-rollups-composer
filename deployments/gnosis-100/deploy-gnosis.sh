@@ -195,14 +195,24 @@ SHARED_DIR_DEFAULT="/tmp/deploy-gnosis-$$"
 SHARED_DIR="${SHARED_DIR:-$SHARED_DIR_DEFAULT}"
 mkdir -p "$SHARED_DIR"
 CCM_ADDR_LOWER=$(echo "${CROSS_CHAIN_MANAGER_ADDRESS#0x}" | tr '[:upper:]' '[:lower:]')
+BUILDER_ADDR_LOWER=$(echo "${BUILDER_ADDRESS#0x}" | tr '[:upper:]' '[:lower:]')
 echo ""
-echo "Injecting CCM pre-mint balance into genesis.json for address ${CCM_ADDR_LOWER}..."
+echo "Injecting CCM pre-mint and builder funding into genesis.json..."
 cp "$GENESIS_JSON" "${SHARED_DIR}/genesis.json"
+# CCM pre-mint: 1M ETH so cross-chain calls have a balance to draw on.
 sed -i "/\"alloc\": {/a\\    \"${CCM_ADDR_LOWER}\": { \"balance\": \"0xD3C21BCECCEDA1000000\" }," "${SHARED_DIR}/genesis.json"
+# Builder funding: needed because block 1's protocol txs (deploy L2Context,
+# CCM, Bridge L2, initialize) are signed and gas-paid by the builder. On
+# testnet-eez the builder is reth dev#0 which is in the shared genesis alloc;
+# on real L1s the per-deployment builder address is not, and block 1 fails
+# with "lack of funds for max fee" if we don't fund it here.
+BUILDER_BALANCE_HEX="0x200000000000000000000000000000000000000000000000000000000000000"
+sed -i "/\"alloc\": {/a\\    \"${BUILDER_ADDR_LOWER}\": { \"balance\": \"${BUILDER_BALANCE_HEX}\" }," "${SHARED_DIR}/genesis.json"
 GENESIS_JSON_MODIFIED="${SHARED_DIR}/genesis.json"
-# Verify injection succeeded
+# Verify both injections succeeded
 grep -q "$CCM_ADDR_LOWER" "$GENESIS_JSON_MODIFIED" && echo "  CCM address found in genesis" || { echo "  FATAL: CCM address not in genesis"; exit 1; }
-grep -q "0xD3C21BCECCEDA1000000" "$GENESIS_JSON_MODIFIED" && echo "  Pre-mint balance found" || { echo "  FATAL: Pre-mint balance not in genesis"; exit 1; }
+grep -q "0xD3C21BCECCEDA1000000" "$GENESIS_JSON_MODIFIED" && echo "  CCM pre-mint balance found" || { echo "  FATAL: CCM pre-mint balance not in genesis"; exit 1; }
+grep -q "$BUILDER_ADDR_LOWER" "$GENESIS_JSON_MODIFIED" && echo "  Builder address found in genesis" || { echo "  FATAL: Builder address not in genesis"; exit 1; }
 
 # ── Compute genesis state root ────────────────────────────────────────
 
