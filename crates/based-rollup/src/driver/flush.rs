@@ -727,29 +727,35 @@ where
         // touching the hold field at all — invariant #1 only applies
         // when there are actual entries).
         let gas_hint = self.compute_gas_overbid();
-        // In bundle mode, drain queued user L1 txs BEFORE submit so they can
-        // ride in the same `eth_sendBundle` as postBatch. Without this, the
-        // post-submit `forward_queued_l1_txs` call later in this function
-        // sends them via `eth_sendRawTransaction` to the public mempool,
-        // where they land in some later block — breaking the contract's
-        // `lastStateUpdateBlock == block.number` invariant in
-        // `executeCrossChainCall` and reverting with
-        // `ExecutionNotInCurrentBlock()`. On submit failure we re-queue them
-        // (see `SendResult::Failed` handling below).
+        // Only drain queued user L1 txs when we are about to submit a Collected
+        // plan in bundle mode. Otherwise leave the queue alone:
+        //   - has_entries=false: blocks-only flush, no executeCrossChainCall
+        //     piggybacking. Draining here would silently drop the user tx
+        //     since the NoEntries path passes `&[]` to send_to_l1.
+        //   - raw-RPC mode (reth --dev): post-submit `forward_queued_l1_txs`
+        //     handles them; the proposer also drives block production so they
+        //     land in the same block as postBatch by construction.
         //
-        // In raw-RPC mode (e.g., reth --dev) we leave the queue alone — the
-        // builder also drives block production, so the post-submit
-        // `forward_queued_l1_txs` call lands user txs in the same block as
-        // postBatch by construction. Bundling there would be wasted work.
-        let bundled_user_txs: Vec<Bytes> = if proposer.uses_bundle_submission() {
-            let mut q = self
-                .pending_l1_forward_txs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            q.drain(..).collect()
-        } else {
-            Vec::new()
-        };
+        // Atomicity rationale (bundle mode + has_entries): forwarded user txs
+        // (e.g. bridgeEther from the L1 composer RPC) MUST share
+        // `(parent_hash, block.timestamp)` with the postBatch. If they enter
+        // public mempool separately they land in a later block and the
+        // contract's `lastStateUpdateBlock == block.number` invariant in
+        // `executeCrossChainCall` reverts with
+        // `ExecutionNotInCurrentBlock()`. Including them in the same
+        // `eth_sendBundle.txs` array makes both land or both drop together.
+        // On submit failure we restore the drained txs to the front of the
+        // queue (see `SendResult::Failed` arm).
+        let bundled_user_txs: Vec<Bytes> =
+            if has_entries && proposer.uses_bundle_submission() {
+                let mut q = self
+                    .pending_l1_forward_txs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                q.drain(..).collect()
+            } else {
+                Vec::new()
+            };
         let send_result = if has_entries {
             let plan = FlushPlan::<Collected>::new_collected(blocks, pending_l1_owned)
                 .arm_hold(&mut self.hold);
@@ -763,7 +769,6 @@ where
             plan.submit_via(proposer, gas_hint, &bundled_user_txs).await
         } else {
             let plan = FlushPlan::<NoEntries>::new_blocks_only(blocks);
-            // Blocks-only plans never carry user txs — pass empty.
             plan.submit_via(proposer, gas_hint, &[]).await
         };
 
