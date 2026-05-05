@@ -53,6 +53,11 @@ services:
       - ../shared/scripts:/app/scripts:ro
       - chiado-shared:/shared
       - chiado-builder-data:/data
+      # Mount the deploy-script's modified genesis (with CCM pre-mint + builder
+      # funding) so the L2 boots from the same genesis whose state root was
+      # committed to L1 via createRollup. deploy-gnosis.sh writes this when
+      # SHARED_DIR points at this directory.
+      - ./genesis.json:/etc/based-rollup/genesis.json:ro
     ports:
       - "9545:8545"   # L2 JSON-RPC
       - "9548:8547"   # L2 RPC Proxy
@@ -83,6 +88,7 @@ services:
       - ../shared/scripts:/app/scripts:ro
       - chiado-shared:/shared:ro
       - chiado-fullnode1-data:/data
+      - ./genesis.json:/etc/based-rollup/genesis.json:ro
     environment:
       BLOCK_TIME: "5"
       L1_RPC_URL: "${GNOSIS_RPC_URL:-}"
