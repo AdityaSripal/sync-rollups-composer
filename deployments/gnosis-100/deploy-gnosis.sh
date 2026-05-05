@@ -112,6 +112,7 @@ VERIFIER_OUTPUT=$(forge create \
     --rpc-url "$GNOSIS_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
+    --gas-limit 3000000 \
     src/verifier/tmpECDSAVerifier.sol:tmpECDSAVerifier \
     --constructor-args "$DEPLOYER_ADDR" "$BUILDER_ADDRESS" 2>&1)
 echo "$VERIFIER_OUTPUT"
@@ -131,6 +132,7 @@ ROLLUPS_OUTPUT=$(forge create \
     --rpc-url "$GNOSIS_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
+    --gas-limit 8000000 \
     src/Rollups.sol:Rollups \
     --constructor-args "$VERIFIER_ADDRESS" 1 2>&1)
 echo "$ROLLUPS_OUTPUT"
@@ -195,6 +197,7 @@ echo "Genesis state root: ${GENESIS_STATE_ROOT}"
 
 echo "Registering rollup (createRollup)..."
 REGISTER_OUTPUT=$(cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+    --gas-limit 1500000 \
     "$ROLLUPS_ADDRESS" \
     "createRollup(bytes32,bytes32,address)(uint256)" \
     "$GENESIS_STATE_ROOT" \
@@ -267,6 +270,7 @@ BRIDGE_BYTECODE_FILE="${SHARED_DIR}/bridge_bytecode.txt"
 echo "$BRIDGE_BYTECODE" > "$BRIDGE_BYTECODE_FILE"
 
 BRIDGE_DEPLOY_OUTPUT=$(cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+    --gas-limit 8000000 \
     --create "$BRIDGE_BYTECODE" 2>&1)
 BRIDGE_L1_ADDRESS=$(echo "$BRIDGE_DEPLOY_OUTPUT" | grep "contractAddress" | awk '{print $NF}')
 
@@ -275,6 +279,7 @@ if [ -n "$BRIDGE_L1_ADDRESS" ] && [ "$BRIDGE_L1_ADDRESS" != "null" ]; then
 
     # Initialize: manager=Rollups, rollupId=0 (L1), admin=deployer
     cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+        --gas-limit 1500000 \
         "$BRIDGE_L1_ADDRESS" \
         "initialize(address,uint256,address)" \
         "$ROLLUPS_ADDRESS" 0 "$DEPLOYER_ADDR" > /dev/null 2>&1
@@ -283,13 +288,15 @@ if [ -n "$BRIDGE_L1_ADDRESS" ] && [ "$BRIDGE_L1_ADDRESS" != "null" ]; then
     # Set canonical bridge address: L1 Bridge -> L2 Bridge address
     echo "Setting canonicalBridgeAddress on L1 Bridge -> ${BRIDGE_L2_ADDRESS}..."
     cast send --rpc-url "$GNOSIS_RPC" --private-key "$DEPLOYER_KEY" \
+        --gas-limit 200000 \
         "$BRIDGE_L1_ADDRESS" \
         "setCanonicalBridgeAddress(address)" \
         "$BRIDGE_L2_ADDRESS" > /dev/null 2>&1
     echo "L1 Bridge canonicalBridgeAddress set to ${BRIDGE_L2_ADDRESS}"
 else
     echo "ERROR: Bridge L1 deployment failed"
-    echo "Deploy output: $(echo "$BRIDGE_DEPLOY_OUTPUT" | head -5)"
+    echo "Deploy output:"
+    echo "$BRIDGE_DEPLOY_OUTPUT"
     rm -f "$BRIDGE_BYTECODE_FILE"
     exit 1
 fi
