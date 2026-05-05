@@ -486,9 +486,27 @@ impl Proposer {
             ));
         }
 
+        // Set an explicit gas limit so alloy skips the eth_estimateGas pre-flight.
+        //
+        // On a real L1 (e.g., Chiado), the simulator runs estimateGas with
+        // `block.timestamp = latest_block.timestamp` (no lookahead), but the
+        // proposer signs publicInputsHash against the predicted next-slot
+        // timestamp `latest + block_time`. The two timestamps differ, so the
+        // contract's recomputed publicInputsHash doesn't match the signed one,
+        // and tmpECDSAVerifier rejects with `InvalidProof()`. The tx is killed
+        // before it ever broadcasts.
+        //
+        // With an explicit gas limit alloy skips estimateGas entirely; the tx
+        // broadcasts and lands in some future block whose actual `block.timestamp`
+        // may or may not match the signed one (depending on slot timing /
+        // missed slots). Failures here cost gas but no longer block the
+        // builder forever.
+        const POSTBATCH_GAS_LIMIT: u64 = 5_000_000;
+
         let mut tx = alloy_rpc_types::TransactionRequest::default()
             .to(self.config.rollups_address)
-            .input(calldata.into());
+            .input(calldata.into())
+            .gas_limit(POSTBATCH_GAS_LIMIT);
 
         if let Some(hint) = &gas_price_hint {
             tx = tx
