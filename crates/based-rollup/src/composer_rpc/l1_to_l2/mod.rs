@@ -625,23 +625,39 @@ async fn await_destination_code(
         return Ok(());
     }
 
-    // Slow path: latest is empty. Check pending — does some mempool tx
-    // deploy code here? If not, this destination simply has no code and
-    // the trace will correctly find no cross-chain calls.
-    let pending_code = get_code(client, l1_rpc_url, to, "pending").await?;
-    if pending_code == "0x" {
-        return Ok(());
+    // Phase 1: brief grace period for pending to become non-empty.
+    // The composer forwards a precursor tx (e.g. createCrossChainProxy) just
+    // before this user tx; the L1 RPC accepts it and adds to its mempool, but
+    // there's a small window before the pending block view reflects the new
+    // mempool state. If we sample pending too early, both latest and pending
+    // are "0x" and we'd skip the await entirely. Poll pending briefly to
+    // catch the precursor as it propagates into pending state.
+    const PENDING_GRACE_MS: u64 = 1_500;
+    let started = std::time::Instant::now();
+    let mut pending_code: String;
+    loop {
+        pending_code = get_code(client, l1_rpc_url, to, "pending").await?;
+        if pending_code != "0x" {
+            break;
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(PENDING_GRACE_MS) {
+            // Both latest and pending stayed empty for the grace period →
+            // destination has no code anywhere; let the trace fall through
+            // to the existing "no cross-chain calls" path naturally.
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
 
     tracing::info!(
         target: "based_rollup::l1_proxy",
         %to,
         pending_code_len = pending_code.len(),
+        grace_ms = started.elapsed().as_millis() as u64,
         "destination has pending code but no latest code — holding user tx until precursor mines"
     );
 
-    // Poll latest until code shows up or timeout.
-    let started = std::time::Instant::now();
+    // Phase 2: poll latest until code shows up or hard timeout.
     while started.elapsed() < std::time::Duration::from_millis(AWAIT_CODE_TIMEOUT_MS) {
         tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         let code = get_code(client, l1_rpc_url, to, "latest").await?;
