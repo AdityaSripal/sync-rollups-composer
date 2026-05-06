@@ -395,6 +395,24 @@ async fn trace_and_detect_internal_calls(
     // If this finds only 1 cross-chain call but the tx reverts internally,
     // we retry with state overrides (mock Rollups) to discover hidden calls
     // that would execute after entries are posted (multi-call continuation pattern).
+    //
+    // Trace at "pending" (not "latest") so that pending mempool txs already
+    // submitted by this composer are visible to the simulator. This fixes the
+    // pipelined-create-and-use-proxy pattern from issue #45: when the user
+    // submits `createCrossChainProxy(target, rollupId)` immediately followed
+    // by a value-transfer to that future proxy, both txs reach the composer
+    // before either mines. Tracing the second tx at "latest" sees no code at
+    // the destination (proxy not yet deployed) and returns no cross-chain
+    // calls, so the composer falls through to direct mempool forwarding —
+    // breaking same-block atomicity. Tracing at "pending" lets the simulator
+    // include the in-flight `createCrossChainProxy` so the proxy's bytecode
+    // is present in the simulated state and the inner `executeCrossChainCall`
+    // is detected.
+    //
+    // Same-tx flows (e.g. `Bridge.bridgeEther`, which deploys the proxy and
+    // calls into it within a single user tx) are unaffected because the
+    // create + use happen inside the traced tx itself, regardless of block
+    // tag.
     let trace_result = {
         let trace_req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -407,7 +425,7 @@ async fn trace_and_detect_internal_calls(
                     "value": value,
                     "gas": "0x2faf080"
                 },
-                "latest",
+                "pending",
                 { "tracer": "callTracer" }
             ],
             "id": 1
