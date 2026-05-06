@@ -385,6 +385,39 @@ async fn trace_and_detect_internal_calls(
         .and_then(|v| v.as_str())
         .unwrap_or("0x0");
 
+    // Wait for any pending precursor that deploys code at `to` to mine.
+    //
+    // Pipelined-create-and-use pattern (issue #45): a user submits two txs
+    // back-to-back — first `createCrossChainProxy(target, rollupId)` to deploy
+    // a proxy contract, then a value-transfer or call to the resulting proxy
+    // address. If both txs are in-flight when this composer traces the second,
+    // the proxy doesn't exist at the L1 RPC's `latest` block and the trace
+    // returns no calls — composer falls through to direct mempool forwarding,
+    // breaking same-block atomicity.
+    //
+    // Reth's `debug_traceCall` doesn't apply pending mempool to its pre-state
+    // (only to the block header), so tracing at "pending" doesn't help. But
+    // reth's `eth_getCode("pending")` DOES return the predicted code from
+    // mempool effects. So:
+    //   - if `to` already has code at "latest" → proceed normally
+    //   - if "latest" empty but "pending" has code → a precursor tx will
+    //     deploy code here. Wait briefly for that precursor to mine.
+    //   - if both empty → not a deployable cross-chain target; let the
+    //     existing trace path return "not cross-chain" naturally.
+    //
+    // Adds at most ~one L1 slot of latency in the pipelined case. Bounded by
+    // a small timeout so a stuck precursor (dropped from mempool, etc.)
+    // doesn't hang the user request indefinitely.
+    if let Err(e) =
+        await_destination_code(client, l1_rpc_url, to).await
+    {
+        tracing::debug!(
+            target: "based_rollup::l1_proxy",
+            %e, %to,
+            "await_destination_code returned non-fatal error — proceeding with trace anyway"
+        );
+    }
+
     tracing::info!(
         target: "based_rollup::l1_proxy",
         %to, %from,
@@ -540,6 +573,96 @@ async fn trace_and_detect_internal_calls(
         &mut proxy_cache,
     )
     .await
+}
+
+/// If the destination address has no code at `latest` but does at `pending`,
+/// poll `latest` until the code shows up (i.e. wait for the in-flight precursor
+/// tx that deploys it to mine). Returns Ok(()) once `latest` has code, on a
+/// fast-path "code already there", or on the "no pending code at all" case.
+/// Bounded by a hard timeout so we never block forever.
+///
+/// See the call site in `trace_and_detect_internal_calls` for full rationale
+/// (issue #45 pipelined-create-and-use pattern).
+async fn await_destination_code(
+    client: &reqwest::Client,
+    l1_rpc_url: &str,
+    to: &str,
+) -> eyre::Result<()> {
+    /// Max time we'll hold the user's tx waiting for a precursor to mine.
+    /// Three Chiado/Gnosis L1 slots (~5s each) — enough to absorb one missed
+    /// slot. Beyond this, give up and let the trace run anyway (it will
+    /// return "no cross-chain calls" and the tx will be forwarded normally).
+    const AWAIT_CODE_TIMEOUT_MS: u64 = 15_000;
+    /// Polling interval for `eth_getCode("latest")`. Must be << one L1 slot
+    /// so we catch the precursor as soon as it lands.
+    const POLL_INTERVAL_MS: u64 = 500;
+
+    async fn get_code(
+        client: &reqwest::Client,
+        l1_rpc_url: &str,
+        to: &str,
+        block: &str,
+    ) -> eyre::Result<String> {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getCode",
+            "params": [to, block],
+            "id": 1,
+        });
+        let resp: super::common::JsonRpcResponse =
+            client.post(l1_rpc_url).json(&req).send().await?.json().await?;
+        match resp.into_result() {
+            Ok(Value::String(s)) => Ok(s),
+            Ok(other) => Err(eyre::eyre!("eth_getCode returned non-string: {other:?}")),
+            Err(e) => Err(eyre::eyre!("eth_getCode failed: {e}")),
+        }
+    }
+
+    // Fast path: code already exists at latest. Common case (proxy already
+    // deployed in some prior block) — no waiting needed.
+    let latest_code = get_code(client, l1_rpc_url, to, "latest").await?;
+    if latest_code != "0x" {
+        return Ok(());
+    }
+
+    // Slow path: latest is empty. Check pending — does some mempool tx
+    // deploy code here? If not, this destination simply has no code and
+    // the trace will correctly find no cross-chain calls.
+    let pending_code = get_code(client, l1_rpc_url, to, "pending").await?;
+    if pending_code == "0x" {
+        return Ok(());
+    }
+
+    tracing::info!(
+        target: "based_rollup::l1_proxy",
+        %to,
+        pending_code_len = pending_code.len(),
+        "destination has pending code but no latest code — holding user tx until precursor mines"
+    );
+
+    // Poll latest until code shows up or timeout.
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(AWAIT_CODE_TIMEOUT_MS) {
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        let code = get_code(client, l1_rpc_url, to, "latest").await?;
+        if code != "0x" {
+            tracing::info!(
+                target: "based_rollup::l1_proxy",
+                %to,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "precursor mined — destination now has code at latest"
+            );
+            return Ok(());
+        }
+    }
+
+    tracing::warn!(
+        target: "based_rollup::l1_proxy",
+        %to,
+        timeout_ms = AWAIT_CODE_TIMEOUT_MS,
+        "timed out waiting for destination code at latest — proceeding with trace (will likely miss cross-chain detection)"
+    );
+    Ok(())
 }
 
 /// Decode a raw signed transaction into a JSON object suitable for tracing.
