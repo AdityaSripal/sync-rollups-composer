@@ -108,30 +108,25 @@ _bc() { (grep -o '"object":"0x[0-9a-fA-F]*"' "$1" || true) | head -1 | sed 's/"o
 # ── Deploy MultiSignerECDSAVerifier ──────────────────────────────────
 # Variant of tmpECDSAVerifier that authorizes a SET of signers, simulating the
 # eventual ZK-prover model where any valid proof from any prover is accepted.
-# Lives in contracts/test/ (not the protocol submodule). Multibuilder
-# experiments only — production rollups use a real ZK verifier.
-
-echo ""
-echo "Building experimental contracts (test/MultiSignerECDSAVerifier)..."
-cd "$CONTRACTS_DIR"
-forge build --skip test --skip script --skip "visualizat*" 2>&1 | tail -3 || true
+# Lives in the sync-rollups-protocol submodule under src/verifier/. Pulled in
+# via the submodule pointer at this repo's parent — `git submodule update
+# --init --recursive` must include the experiment/multi-signer-verifier branch
+# (or any branch that includes the contract).
+#
+# Multibuilder experiments only — production rollups use a real ZK verifier.
 
 echo ""
 echo "Deploying MultiSignerECDSAVerifier (owner=${DEPLOYER_ADDR}, signers=[${BUILDER_ADDRESS}, ${BUILDER2_ADDRESS}])..."
 VERIFIER_OUTPUT=$(forge create \
-    --root "$CONTRACTS_DIR" \
     --rpc-url "$CHIADO_RPC" \
     --private-key "$DEPLOYER_KEY" \
     --broadcast \
-    test/MultiSignerECDSAVerifier.sol:MultiSignerECDSAVerifier \
+    src/verifier/MultiSignerECDSAVerifier.sol:MultiSignerECDSAVerifier \
     --constructor-args "$DEPLOYER_ADDR" "[${BUILDER_ADDRESS},${BUILDER2_ADDRESS}]" 2>&1)
 echo "$VERIFIER_OUTPUT"
 VERIFIER_ADDRESS=$(echo "$VERIFIER_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 [ -n "$VERIFIER_ADDRESS" ] || { echo "ERROR: Failed to deploy MultiSignerECDSAVerifier"; exit 1; }
 echo "MultiSignerECDSAVerifier deployed at: ${VERIFIER_ADDRESS}"
-
-# Re-enter the protocol submodule for the rest of the deploys (Rollups, Bridge).
-cd "$CONTRACTS_DIR/sync-rollups-protocol"
 
 # ── Deploy Rollups contract ───────────────────────────────────────────
 
