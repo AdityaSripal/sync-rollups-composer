@@ -1,0 +1,19 @@
+# deployments/chiado-multibuilder/docker-compose.dev.yml — Dev overlay
+#
+# Mounts the locally compiled binary into both builder services so we can
+# iterate without rebuilding the Docker image on every change.
+
+services:
+  builder1:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile.dev
+      target: runtime
+    image: based-rollup:dev
+    volumes:
+      - ../../target/${BUILD_PROFILE:-release}/based-rollup:/usr/local/bin/based-rollup
+
+  builder2:
+    image: based-rollup:dev
+    volumes:
+      - ../../target/${BUILD_PROFILE:-release}/based-rollup:/usr/local/bin/based-rollup
