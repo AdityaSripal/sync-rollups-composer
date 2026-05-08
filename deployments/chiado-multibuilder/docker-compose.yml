@@ -118,6 +118,7 @@ services:
     environment:
       BLOCK_TIME: "5"
       BUILDER_PRIVATE_KEY: "${BUILDER2_PRIVATE_KEY:?Set BUILDER2_PRIVATE_KEY in .env}"
+      BUILDER_ADDRESS: "${BUILDER2_ADDRESS:?Set BUILDER2_ADDRESS in .env}"
       L1_RPC_URL: "${GNOSIS_RPC_URL:?Set GNOSIS_RPC_URL in .env}"
       L1_BUILDER_RPC_URL: "${L1_BUILDER_RPC_URL:?Set L1_BUILDER_RPC_URL in .env}"
       BRIDGE_L1_ADDRESS: "${BRIDGE_L1_ADDRESS:-}"
@@ -131,12 +132,6 @@ services:
     depends_on:
       init-config:
         condition: service_completed_successfully
-      # Wait for builder1 to come up first — block 1's protocol txs (L2Context,
-      # CCM, Bridge L2 deploys) are signed by whichever builder produces block 1.
-      # Their L2 addresses are deterministic from builder1's address (the address
-      # baked into rollup-gnosis.env at deploy time). builder2 must derive
-      # block 1 from L1 BatchPosted events to see the existing contracts —
-      # competing only starts from block 2 onward.
       builder1:
         condition: service_healthy
 
