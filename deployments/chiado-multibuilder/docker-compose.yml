@@ -1,0 +1,141 @@
+# deployments/chiado-multibuilder/docker-compose.yml
+# Multi-builder experiment on PUBLIC Chiado.
+#
+# Identical to chiado-10200-public/ except:
+#   - Uses MultiSignerECDSAVerifier (contracts/test/) which authorizes a SET of
+#     signers, not just one. Lets two builders submit valid postBatches against
+#     the same rollup_id and race on L1 ordering — approximating the eventual
+#     ZK-prover model where any party producing a valid proof is accepted.
+#   - Spins up TWO builder services (`builder1` and `builder2`), each with its
+#     own private key, ports, and data volume. Both produce L2 blocks locally,
+#     both sign valid postBatches, both compete on L1.
+#   - Volumes/ports prefixed `chiado-mb-` and offset by +200 from chiado-10200-public/
+#     so all three deployments can coexist on the same host.
+#
+# What to watch for once running:
+#   - Each builder builds its own L2 view (own mempool ordering, own block contents).
+#   - Bundles race on L1: whichever lands first wins; the other's bundle either
+#     drops at the builder RPC or its postBatch reverts on state-delta mismatch.
+#   - The losing builder rebuilds on top of the winner's state via
+#     `rebuild_with_fresh_l1_context`, then competes again.
+#   - Convergence: do both builders eventually agree on the L2 chain history?
+#     They should — L1 is canonical — but the dynamics under contention are the
+#     interesting question.
+#
+# Prerequisites:
+#   1. Run deploy.sh with TWO builder keys to deploy contracts and generate
+#      rollup-gnosis.env + genesis.json (with both builders pre-minted).
+#   2. Copy .env.example to .env and fill in BOTH BUILDER_PRIVATE_KEYs.
+#   3. Both builder accounts funded with Chiado xDAI (faucet).
+#
+# Usage (from repo root):
+#   docker compose -f deployments/chiado-multibuilder/docker-compose.yml \
+#                  --env-file deployments/chiado-multibuilder/.env up -d
+#   docker compose -f deployments/chiado-multibuilder/docker-compose.yml \
+#                  --env-file deployments/chiado-multibuilder/.env logs -f builder1 builder2
+
+services:
+  init-config:
+    image: busybox:1.36
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        if [ ! -f /config/rollup-gnosis.env ]; then
+          echo "ERROR: rollup-gnosis.env not found. Run deploy.sh first."
+          exit 1
+        fi
+        if [ ! -f /config/genesis.json ]; then
+          echo "ERROR: genesis.json not found. Run deploy.sh first."
+          exit 1
+        fi
+        if [ ! -f /shared/rollup.env ]; then
+          cp /config/rollup-gnosis.env /shared/rollup.env
+        fi
+        if [ ! -f /shared/genesis.json ]; then
+          cp /config/genesis.json /shared/genesis.json
+        fi
+        cat /shared/rollup.env
+    volumes:
+      - ./rollup-gnosis.env:/config/rollup-gnosis.env:ro
+      - ./genesis.json:/config/genesis.json:ro
+      - chiado-mb-shared:/shared
+
+  builder1:
+    extends:
+      file: ../shared/docker-compose.base.yml
+      service: builder
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: runtime
+    stop_grace_period: 30s
+    volumes:
+      - ../shared/scripts:/app/scripts:ro
+      - chiado-mb-shared:/shared
+      - chiado-mb-builder1-data:/data
+    ports:
+      - "9745:8545"   # L2 JSON-RPC
+      - "9748:8547"   # L2 RPC Proxy
+      - "9756:9556"   # L1 RPC Proxy
+      - "9760:9100"   # Health endpoint
+      - "127.0.0.1:9750:8546"   # L2 WebSocket
+    environment:
+      BLOCK_TIME: "5"
+      BUILDER_PRIVATE_KEY: "${BUILDER1_PRIVATE_KEY:?Set BUILDER1_PRIVATE_KEY in .env}"
+      L1_RPC_URL: "${GNOSIS_RPC_URL:?Set GNOSIS_RPC_URL in .env}"
+      L1_BUILDER_RPC_URL: "${L1_BUILDER_RPC_URL:?Set L1_BUILDER_RPC_URL in .env}"
+      BRIDGE_L1_ADDRESS: "${BRIDGE_L1_ADDRESS:-}"
+      BRIDGE_L2_ADDRESS: "${BRIDGE_L2_ADDRESS:-}"
+      HEALTH_PORT: "${HEALTH_PORT:-9100}"
+      GENESIS: /shared/genesis.json
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+    depends_on:
+      init-config:
+        condition: service_completed_successfully
+
+  builder2:
+    extends:
+      file: ../shared/docker-compose.base.yml
+      service: builder
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: runtime
+    stop_grace_period: 30s
+    volumes:
+      - ../shared/scripts:/app/scripts:ro
+      - chiado-mb-shared:/shared
+      - chiado-mb-builder2-data:/data
+    ports:
+      - "9845:8545"   # L2 JSON-RPC
+      - "9848:8547"   # L2 RPC Proxy
+      - "9856:9556"   # L1 RPC Proxy
+      - "9860:9100"   # Health endpoint
+      - "127.0.0.1:9850:8546"   # L2 WebSocket
+    environment:
+      BLOCK_TIME: "5"
+      BUILDER_PRIVATE_KEY: "${BUILDER2_PRIVATE_KEY:?Set BUILDER2_PRIVATE_KEY in .env}"
+      BUILDER_ADDRESS: "${BUILDER2_ADDRESS:?Set BUILDER2_ADDRESS in .env}"
+      L1_RPC_URL: "${GNOSIS_RPC_URL:?Set GNOSIS_RPC_URL in .env}"
+      L1_BUILDER_RPC_URL: "${L1_BUILDER_RPC_URL:?Set L1_BUILDER_RPC_URL in .env}"
+      BRIDGE_L1_ADDRESS: "${BRIDGE_L1_ADDRESS:-}"
+      BRIDGE_L2_ADDRESS: "${BRIDGE_L2_ADDRESS:-}"
+      HEALTH_PORT: "${HEALTH_PORT:-9100}"
+      GENESIS: /shared/genesis.json
+    healthcheck:
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+    depends_on:
+      init-config:
+        condition: service_completed_successfully
+      builder1:
+        condition: service_healthy
+
+volumes:
+  chiado-mb-shared:
+  chiado-mb-builder1-data:
+  chiado-mb-builder2-data:
